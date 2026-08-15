@@ -22,6 +22,9 @@ Standalone Playwright microservice that scrapes live BIS (Building Information S
 |---|---|---|
 | `SCRAPER_SECRET` | Yes | Shared secret for `X-Scraper-Secret` header auth. Generate with `openssl rand -hex 16` (32 hex chars). Must match `BIS_SCRAPER_SECRET` in Supabase. |
 | `PORT` | Auto | Set automatically by Railway. Do not set manually. |
+| `PROXY_SERVER` | No | Playwright proxy URL used only for retry after a direct BIS request is blocked. |
+| `PROXY_USERNAME` | No | Proxy username. Never include it in logs. |
+| `PROXY_PASSWORD` | No | Proxy password. Never include it in logs. |
 
 ---
 
@@ -129,9 +132,23 @@ Fetches all job filings for a BIN from the BIS Jobs by Location page, including 
     }
   ],
   "job_count": 1,
+  "expected_count": 1,
+  "page_verified": true,
+  "complete": true,
+  "completeness_reason": "parsed_count_matches_expected",
   "scraped_at": "2024-01-15T10:30:00.000000"
 }
 ```
+
+`page_verified` means the response was positively identified as the BIS jobs
+page. `complete` is a stricter count reconciliation. When BIS does not publish
+an expected total on the result page, `complete` is `false` and
+`completeness_reason` is `expected_count_not_available`; callers must not
+represent that response as proven complete.
+
+WAF challenges, redirects to an unexpected page, and navigation/parsing errors
+return a non-2xx status. A caller must treat any non-2xx response as unavailable,
+not as a successful response containing zero jobs.
 
 ---
 
@@ -178,3 +195,15 @@ playwright install chromium
 SCRAPER_SECRET=dev-secret python server.py
 # → http://localhost:8080/health
 ```
+
+Run the safety tests before deployment:
+
+```bash
+python -m unittest -v test_server.py
+```
+
+After deployment, confirm `/health` returns HTTP 200 and that
+`secret_configured` is true. Then run known non-empty, known-empty, and
+known-gap BINs through the authenticated endpoint. Do not promote scraper data
+until the consumer records `page_verified`, `complete`, parsed count, expected
+count, HTTP status, and scrape timestamp.

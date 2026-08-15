@@ -26,6 +26,65 @@ app = Flask(__name__)
 
 PORT = int(os.environ.get("PORT", 8080))
 SCRAPER_SECRET = os.environ.get("SCRAPER_SECRET", "")
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "")
+PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
+
+
+BLOCK_SIGNATURES = [
+    "Access Denied",
+    "errors.edgesuite.net",
+    "Pardon Our Interruption",
+    "Request unsuccessful",
+    "/_Incapsula_Resource",
+    "captcha",
+]
+
+
+def proxy_config():
+    """Return Playwright proxy settings without ever logging credentials."""
+    if not PROXY_SERVER:
+        return None
+    config = {"server": PROXY_SERVER}
+    if PROXY_USERNAME:
+        config["username"] = PROXY_USERNAME
+    if PROXY_PASSWORD:
+        config["password"] = PROXY_PASSWORD
+    return config
+
+
+def detect_block(html, page_url, expected_markers):
+    """Reject challenge pages and HTTP-200 responses for the wrong page."""
+    lowered = html.lower()
+    for signature in BLOCK_SIGNATURES:
+        if signature.lower() in lowered:
+            return f"blocked ({signature})"
+    if expected_markers and not any(marker.lower() in lowered for marker in expected_markers):
+        return f"unexpected page (expected BIS content, url={page_url})"
+    return None
+
+
+def extract_expected_job_count(html):
+    """Read an advertised BIS result count when the page supplies one."""
+    patterns = [
+        r"Total\s+(?:Jobs|Records|Filings)\s*:?\s*(?:<[^>]+>|&nbsp;|\s)*(\d[\d,]*)",
+        r"(?:Jobs|Records|Filings)\s+Found\s*:?\s*(\d[\d,]*)",
+        r"Displaying\s+\d+\s*(?:-|to)\s*\d+\s+of\s+(\d[\d,]*)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+        if match:
+            return int(match.group(1).replace(",", ""))
+    return None
+
+
+def result_http_status(result):
+    """Map scraper outcomes to transport status so failures cannot look empty."""
+    if result.get("blocked"):
+        return 503
+    if result.get("error"):
+        return 502
+    return 200
 
 
 def log(msg):
@@ -46,6 +105,7 @@ def health():
         "status": "ok",
         "service": "bincheck-bis-scraper",
         "secret_configured": bool(SCRAPER_SECRET),
+        "proxy_configured": bool(PROXY_SERVER),
     })
 
 
@@ -89,32 +149,52 @@ def scrape_bis():
 
         log(f"Scrape: action={action}, bin={bin_number}, job={job_number}")
 
+        def run_attempt(pw, proxy=None):
+            launch_options = {
+                "headless": True,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--no-sandbox",
+                ],
+            }
+            if proxy:
+                launch_options["proxy"] = proxy
+            browser = pw.chromium.launch(**launch_options)
+            try:
+                page = browser.new_page(
+                    user_agent="Mozilla/5.0 (X11; Linux x86_64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/131.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                )
+                if action == "profile":
+                    return scrape_profile(page, bin_number, boro, block, lot, debug)
+                if action == "jobs":
+                    return scrape_jobs_by_location(page, bin_number, debug, boro, block, lot)
+                if action in ("job_detail", "job"):
+                    return scrape_job_detail(page, job_number, bin_number, debug)
+                if action == "dof_ptaps":
+                    return fetch_dof_ptaps(page, bbl, debug)
+                if action == "dep_cis":
+                    return fetch_dep_cis(page, bbl, address, debug)
+                return {"error": f"Unknown action: {action}"}
+            finally:
+                browser.close()
+
         pw = sync_playwright().start()
-        browser = pw.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/120.0.0.0 Safari/537.36"
-        )
+        try:
+            result = run_attempt(pw)
+            if result.get("blocked") and proxy_config():
+                log("Direct request rejected; retrying with configured proxy")
+                result = run_attempt(pw, proxy=proxy_config())
+                result["via_proxy"] = True
+        finally:
+            pw.stop()
 
-        result = {}
-
-        if action == "profile":
-            result = scrape_profile(page, bin_number, boro, block, lot, debug)
-        elif action == "jobs":
-            result = scrape_jobs_by_location(page, bin_number, debug, boro, block, lot)
-        elif action in ("job_detail", "job"):
-            result = scrape_job_detail(page, job_number, bin_number, debug)
-        elif action == "dof_ptaps":
-            result = fetch_dof_ptaps(page, bbl, debug)
-        elif action == "dep_cis":
-            result = fetch_dep_cis(page, bbl, address, debug)
-        else:
-            result = {"error": f"Unknown action: {action}"}
-
-        browser.close()
-        pw.stop()
-        return jsonify(result)
+        return jsonify(result), result_http_status(result)
 
     except Exception as e:
         log(f"Scrape ERROR: {e}")
@@ -170,8 +250,9 @@ def scrape_profile(page, bin_number, boro, block, lot, debug=False):
 
     html = page.content()
 
-    if "Access Denied" in html:
-        return {"error": "Access denied by Akamai", "blocked": True}
+    block_reason = detect_block(html, page.url, ["Property Profile"])
+    if block_reason:
+        return {"error": block_reason, "blocked": True, "page_url": page.url}
 
     if debug:
         return {"html": html[:50000], "html_length": len(html)}
@@ -279,17 +360,44 @@ def scrape_jobs_by_location(page, bin_number, debug=False, boro=None, block=None
 
     html = page.content()
 
-    if "Access Denied" in html:
-        return {"error": "Access denied by Akamai", "blocked": True}
+    block_reason = detect_block(
+        html,
+        page.url,
+        ["FILE DATE", "Jobs/Filings", "NO JOBS", "NO RECORDS"],
+    )
+    if block_reason:
+        log(f"Jobs rejected: {block_reason}")
+        return {
+            "error": block_reason,
+            "blocked": True,
+            "page_url": page.url,
+            "jobs": [],
+            "job_count": 0,
+            "page_verified": False,
+            "complete": False,
+        }
 
     if debug:
         return {"html": html[:50000], "html_length": len(html)}
 
     jobs = parse_bis_jobs_table(html)
+    expected_count = extract_expected_job_count(html)
+    complete = expected_count is not None and len(jobs) == expected_count
     return {
         "bin": bin_number,
         "jobs": jobs,
         "job_count": len(jobs),
+        "expected_count": expected_count,
+        "page_verified": True,
+        "complete": complete,
+        "completeness_reason": (
+            "parsed_count_matches_expected"
+            if complete
+            else "count_mismatch"
+            if expected_count is not None
+            else "expected_count_not_available"
+        ),
+        "page_url": page.url,
         "scraped_at": datetime.utcnow().isoformat(),
     }
 
@@ -344,8 +452,18 @@ def scrape_job_detail(page, job_number, bin_number=None, debug=False):
 
     html = page.content()
 
-    if "Access Denied" in html:
-        return {"error": "Access denied by Akamai — provide bin parameter for reliable results", "blocked": True}
+    block_reason = detect_block(
+        html,
+        page.url,
+        ["FILE DATE", "Jobs/Filings", "JOB #", "NO JOBS", "NO RECORDS"],
+    )
+    if block_reason:
+        return {
+            "error": block_reason,
+            "blocked": True,
+            "page_url": page.url,
+            "documents": [],
+        }
 
     if debug:
         return {"html": html[:50000], "html_length": len(html)}
