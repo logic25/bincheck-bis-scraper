@@ -27,6 +27,27 @@ app = Flask(__name__)
 PORT = int(os.environ.get("PORT", 8080))
 SCRAPER_SECRET = os.environ.get("SCRAPER_SECRET", "")
 
+BLOCK_SIGNATURES = [
+    "Access Denied",
+    "errors.edgesuite.net",
+    "Pardon Our Interruption",
+    "Request unsuccessful",
+    "/_Incapsula_Resource",
+    "captcha",
+]
+
+
+def detect_block(html, page_url, expected_markers=None):
+    """Detect WAF challenges and soft redirects that must not look empty."""
+    lowered = html.lower()
+    for signature in BLOCK_SIGNATURES:
+        if signature.lower() in lowered:
+            return f"blocked ({signature})"
+    markers = expected_markers or []
+    if markers and not any(marker.lower() in lowered for marker in markers):
+        return f"unexpected page (none of {markers} found, url={page_url})"
+    return None
+
 
 def log(msg):
     print(f"[BINCHECK-BIS] {datetime.utcnow().isoformat()} {msg}", flush=True)
@@ -114,7 +135,8 @@ def scrape_bis():
 
         browser.close()
         pw.stop()
-        return jsonify(result)
+        # A block or challenge is an upstream outage, never an empty/clean result.
+        return jsonify(result), (503 if result.get("blocked") else 200)
 
     except Exception as e:
         log(f"Scrape ERROR: {e}")
@@ -170,15 +192,12 @@ def scrape_profile(page, bin_number, boro, block, lot, debug=False):
 
     html = page.content()
 
-    if "Access Denied" in html:
-        return {"error": "Access denied by Akamai", "blocked": True}
+    block_reason = detect_block(html, page.url, ["Property Profile"])
+    if block_reason:
+        return {"error": block_reason, "blocked": True, "page_url": page.url}
 
     if debug:
         return {"html": html[:50000], "html_length": len(html)}
-
-    # Verify we got the property profile page
-    if "Property Profile" not in html:
-        return {"error": "Did not reach Property Profile page", "page_url": page.url}
 
     # Vacate order
     vacate_order = False
